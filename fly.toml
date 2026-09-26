@@ -1,18 +1,27 @@
-# fly.toml app configuration file for Whabot
-app = 'whabot-mz'
-primary_region = 'jnb'
+# fly.toml app configuration file generated for whabot on 2026-09-26T13:02:08Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'whabot'
+primary_region = 'ams'
 
 [build]
   dockerfile = 'Dockerfile'
 
 [env]
-  PORT = '3000'
   DATA_DIR = '/var/data'
+  PORT = '3000'
+
+[[mounts]]
+  source = 'whabot_data'
+  destination = '/var/data'
+  initial_size = '1gb'
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
@@ -21,8 +30,4 @@ primary_region = 'jnb'
   memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-
-[[mounts]]
-  source = 'whabot_data'
-  destination = '/var/data'
-  initial_size = '1gb'
+  memory_mb = 256
