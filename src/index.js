@@ -2,7 +2,10 @@ import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  downloadMediaMessage
+  downloadMediaMessage,
+  Browsers,
+  getUrlInfo,
+  extractUrlFromText
 } from '@whiskeysockets/baileys';
 import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
@@ -52,6 +55,9 @@ const queueManager = new QueueManager();
 let isProcessing = false;
 let abortProcessing = false;
 let latestQR = null;
+let latestPairingCode = null;
+let pairingCodeError = null;
+let isRequestingPairing = false;
 let isConnected = false;
 let globalSock = null;
 
@@ -206,6 +212,34 @@ function parseMultipartBuffer(body, contentType) {
   return { fileData, filename, mimeType, fields };
 }
 
+// Prepara mensagem de texto garantindo que links tenham preview rico (cartão clicável)
+async function prepareTextMessageWithPreview(text, mentions = []) {
+  const msgPayload = {
+    text: text || '',
+    mentions: mentions || []
+  };
+
+  try {
+    const foundUrl = extractUrlFromText(text || '');
+    if (foundUrl) {
+      const urlInfo = await getUrlInfo(foundUrl);
+      if (urlInfo && (urlInfo.title || urlInfo.description || urlInfo.jpegThumbnail)) {
+        msgPayload.matchedText = urlInfo['matched-text'] || foundUrl;
+        msgPayload.canonicalUrl = urlInfo['canonical-url'] || foundUrl;
+        msgPayload.title = urlInfo.title || 'Link';
+        msgPayload.description = urlInfo.description || '';
+        if (urlInfo.jpegThumbnail) {
+          msgPayload.jpegThumbnail = urlInfo.jpegThumbnail;
+        }
+      }
+    }
+  } catch (err) {
+    // Caso ocorra falha de rede ao buscar preview, envia normalmente
+  }
+
+  return msgPayload;
+}
+
 // Função central de divulgação para todos os grupos abertos com menção invisível
 async function executeBroadcast({
   sock,
@@ -324,10 +358,8 @@ async function executeBroadcast({
           mentions: participants
         });
         if (text) {
-          await sock.sendMessage(group.id, {
-            text: text,
-            mentions: participants
-          });
+          const textPayload = await prepareTextMessageWithPreview(text, participants);
+          await sock.sendMessage(group.id, textPayload);
         }
       } else if (mediaBuffer && mediaType === 'document') {
         await sock.sendMessage(group.id, {
@@ -338,10 +370,8 @@ async function executeBroadcast({
           mentions: participants
         });
       } else {
-        await sock.sendMessage(group.id, {
-          text: text,
-          mentions: participants
-        });
+        const textPayload = await prepareTextMessageWithPreview(text, participants);
+        await sock.sendMessage(group.id, textPayload);
       }
 
       sucessos++;
@@ -438,10 +468,8 @@ async function processAutoRespQueue() {
             ptt: false
           }, { quoted: msgObj });
           if (textoUnico) {
-            await sock.sendMessage(fromJid, {
-              text: textoUnico,
-              mentions: isGroup ? mentions : []
-            }, { quoted: msgObj });
+            const textPayload = await prepareTextMessageWithPreview(textoUnico, isGroup ? mentions : []);
+            await sock.sendMessage(fromJid, textPayload, { quoted: msgObj });
           }
         } else {
           // Documento (PDF, DOCX, ZIP, TXT, etc.)
@@ -454,10 +482,8 @@ async function processAutoRespQueue() {
           }, { quoted: msgObj });
         }
       } else {
-        await sock.sendMessage(fromJid, {
-          text: textoUnico,
-          mentions: isGroup ? mentions : []
-        }, { quoted: msgObj });
+        const textPayload = await prepareTextMessageWithPreview(textoUnico, isGroup ? mentions : []);
+        await sock.sendMessage(fromJid, textPayload, { quoted: msgObj });
       }
 
       console.log(`🤖 [Auto-Responder] Resposta enviada para ${fromJid} (${isGroup ? 'GP' : 'PV'}) com mídia/texto.`);
@@ -671,6 +697,9 @@ const server = http.createServer(async (req, res) => {
           isScheduledWaitActive: queueManager.isScheduledWaitActive(),
           nextScheduledRun: queueManager.getNextScheduledRun(),
           latestQR: qrDataUrl,
+          pairingCode: latestPairingCode,
+          pairingCodeError,
+          isRequestingPairing,
           stats
         })
       );
@@ -907,6 +936,46 @@ const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ success: true, message: 'Sessão resetada com sucesso! Gerando novo QR Code...' }));
             return;
           }
+          if (body.action === 'requestPairingCode') {
+            const rawPhone = (body.phoneNumber || '').toString().replace(/\D/g, '');
+            if (!rawPhone || rawPhone.length < 9) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Número de telefone inválido. Digite com DDI (ex: 258841234567 ou 5511999998888).' }));
+              return;
+            }
+
+            if (isConnected) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'O WhatsApp já está conectado!' }));
+              return;
+            }
+
+            if (!globalSock) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'O bot ainda está iniciando o socket. Tente em instantes.' }));
+              return;
+            }
+
+            try {
+              isRequestingPairing = true;
+              pairingCodeError = null;
+              console.log(`📲 Solicitando código de pareamento para o número: ${rawPhone}`);
+              const code = await globalSock.requestPairingCode(rawPhone);
+              latestPairingCode = code;
+              isRequestingPairing = false;
+              console.log(`✅ Código de pareamento gerado com sucesso: ${code}`);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, pairingCode: code }));
+              return;
+            } catch (pErr) {
+              isRequestingPairing = false;
+              pairingCodeError = pErr.message;
+              console.error('❌ Erro ao solicitar código de pareamento:', pErr.message);
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: pErr.message }));
+              return;
+            }
+          }
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, error: 'Ação inválida' }));
         } catch (e) {
@@ -1089,13 +1158,38 @@ const server = http.createServer(async (req, res) => {
 
     <!-- MAIN GRID CONTROLS -->
     <div class="main-grid">
-      <!-- CONEXÃO / QR CODE -->
+      <!-- CONEXÃO / QR CODE E CÓDIGO DE PAREAMENTO -->
       <div class="panel-card">
         <div class="panel-header-title">
           <span>📲 Sessão & Conexão WhatsApp</span>
-          <button id="btn-reset-session" class="btn-danger" style="padding: 5px 12px; font-size: 0.78rem;">📲 Gerar Novo QR Code</button>
+          <button id="btn-reset-session" class="btn-danger" style="padding: 5px 12px; font-size: 0.78rem;">🔄 Resetar Sessão</button>
         </div>
-        <div class="qr-container" id="qr-box">
+
+        <!-- ABAS: CÓDIGO DE PAREAMENTO (RECOMENDADO) VS QR CODE -->
+        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+          <button id="tab-code-btn" type="button" class="btn-sec" style="flex: 1; padding: 7px 10px; font-size: 0.8rem; background: var(--wa-green); color: #111b21; border-color: var(--wa-green);">🔑 Conectar por Código</button>
+          <button id="tab-qr-btn" type="button" class="btn-sec" style="flex: 1; padding: 7px 10px; font-size: 0.8rem;">📷 QR Code</button>
+        </div>
+
+        <!-- ABA 1: CONECTAR POR CÓDIGO (NÚMERO DE TELEFONE) -->
+        <div id="tab-code-content" style="background: var(--wa-card-inner); border-radius: 10px; padding: 14px; border: 1px solid var(--wa-border); margin-bottom: 8px;">
+          <label style="display: block; font-size: 0.82rem; color: var(--wa-text-muted); font-weight: 700; margin-bottom: 6px;">Número do WhatsApp (com código do país/DDI):</label>
+          <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+            <input type="text" id="phone-number-input" placeholder="Ex: 258841234567 ou 5511999998888" style="flex: 1; background: var(--wa-panel); border: 1px solid var(--wa-border); border-radius: 8px; color: var(--wa-text); padding: 8px 12px; font-size: 0.9rem; outline: none;" />
+            <button id="btn-request-code" type="button" style="white-space: nowrap; padding: 8px 14px;">📲 Obter Código</button>
+          </div>
+
+          <div id="pairing-code-display" style="text-align: center; padding: 12px; background: var(--wa-panel); border-radius: 8px; border: 1px dashed var(--wa-green); display: none;">
+            <div style="font-size: 0.75rem; color: var(--wa-text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">Seu Código de Pareamento:</div>
+            <div id="pairing-code-val" style="font-size: 2rem; font-weight: 800; letter-spacing: 6px; color: var(--wa-green); margin: 6px 0; font-family: monospace;">--------</div>
+            <p style="font-size: 0.78rem; color: var(--wa-text-muted); line-height: 1.4;">
+              Abra seu WhatsApp > <b>Aparelhos Conectados</b> > <b>Conectar um Aparelho</b> > <b>Conectar com número de telefone</b> e digite o código acima.
+            </p>
+          </div>
+        </div>
+
+        <!-- ABA 2: QR CODE -->
+        <div class="qr-container" id="qr-box" style="display: none;">
           ${
             isConnected
               ? '<div style="color: #25d366; font-size: 1.25rem; font-weight: 700;">✅ WhatsApp Conectado & Ativo</div><p style="color: var(--wa-text-muted); font-size: 0.85rem; margin-top: 10px;">O bot está respondendo e pronto para processar grupos.</p>'
@@ -1345,14 +1439,27 @@ const server = http.createServer(async (req, res) => {
             btnStopBcast.style.display = 'none';
           }
 
-          // QR Code Box
+          // QR Code & Status de Conexão
           const qrBox = document.getElementById('qr-box');
+          const codeDisplay = document.getElementById('pairing-code-display');
+          const codeVal = document.getElementById('pairing-code-val');
+
           if (d.isConnected) {
             qrBox.innerHTML = '<div style="color: #25d366; font-size: 1.25rem; font-weight: 700;">✅ WhatsApp Conectado & Ativo</div><p style="color: var(--wa-text-muted); font-size: 0.85rem; margin-top: 10px;">O bot está respondendo e pronto para processar grupos.</p>';
-          } else if (d.latestQR) {
-            qrBox.innerHTML = '<img src="' + d.latestQR + '" alt="QR Code WhatsApp" /><p style="color: var(--wa-text-muted); font-size: 0.85rem; margin-top: 10px;">Abra o WhatsApp > Aparelhos Conectados > Conectar um Aparelho</p>';
+            if (codeDisplay) {
+              codeDisplay.style.display = 'block';
+              codeDisplay.innerHTML = '<div style="color: #25d366; font-size: 1.15rem; font-weight: 700;">✅ WhatsApp Conectado & Ativo</div><p style="color: var(--wa-text-muted); font-size: 0.85rem; margin-top: 6px;">Sessão pareada com sucesso.</p>';
+            }
           } else {
-            qrBox.innerHTML = '<p style="color: var(--wa-text-muted);">⏳ Carregando código QR...</p>';
+            if (d.pairingCode && codeDisplay && codeVal) {
+              codeDisplay.style.display = 'block';
+              codeVal.innerText = d.pairingCode;
+            }
+            if (d.latestQR) {
+              qrBox.innerHTML = '<img src="' + d.latestQR + '" alt="QR Code WhatsApp" /><p style="color: var(--wa-text-muted); font-size: 0.85rem; margin-top: 10px;">Abra o WhatsApp > Aparelhos Conectados > Conectar um Aparelho</p>';
+            } else {
+              qrBox.innerHTML = '<p style="color: var(--wa-text-muted);">⏳ Carregando código QR...</p>';
+            }
           }
         }
       } catch (e) {}
@@ -1458,8 +1565,78 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {}
     });
 
+    // Gerenciamento de Abas de Conexão (Código de Pareamento vs QR Code)
+    const tabCodeBtn = document.getElementById('tab-code-btn');
+    const tabQrBtn = document.getElementById('tab-qr-btn');
+    const tabCodeContent = document.getElementById('tab-code-content');
+    const qrBox = document.getElementById('qr-box');
+
+    tabCodeBtn.addEventListener('click', () => {
+      tabCodeBtn.style.background = 'var(--wa-green)';
+      tabCodeBtn.style.color = '#111b21';
+      tabCodeBtn.style.borderColor = 'var(--wa-green)';
+      tabQrBtn.style.background = '';
+      tabQrBtn.style.color = '';
+      tabQrBtn.style.borderColor = '';
+      tabCodeContent.style.display = 'block';
+      qrBox.style.display = 'none';
+    });
+
+    tabQrBtn.addEventListener('click', () => {
+      tabQrBtn.style.background = 'var(--wa-green)';
+      tabQrBtn.style.color = '#111b21';
+      tabQrBtn.style.borderColor = 'var(--wa-green)';
+      tabCodeBtn.style.background = '';
+      tabCodeBtn.style.color = '';
+      tabCodeBtn.style.borderColor = '';
+      tabCodeContent.style.display = 'none';
+      qrBox.style.display = 'flex';
+    });
+
+    const phoneInput = document.getElementById('phone-number-input');
+    if (phoneInput) {
+      phoneInput.addEventListener('focus', () => userEditingSet.add('phone-number-input'));
+      phoneInput.addEventListener('input', () => userEditingSet.add('phone-number-input'));
+      phoneInput.addEventListener('blur', () => userEditingSet.delete('phone-number-input'));
+    }
+
+    document.getElementById('btn-request-code').addEventListener('click', async () => {
+      const phone = (phoneInput.value || '').trim();
+      if (!phone) {
+        showToast('⚠️ Digite o número de telefone com DDI (ex: 258841234567 ou 5511999998888)!');
+        return;
+      }
+
+      const btn = document.getElementById('btn-request-code');
+      btn.disabled = true;
+      btn.innerText = '⏳ Gerando...';
+
+      try {
+        const res = await fetch('/api/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'requestPairingCode', phoneNumber: phone })
+        });
+        const d = await res.json();
+        if (d.success && d.pairingCode) {
+          const display = document.getElementById('pairing-code-display');
+          const codeVal = document.getElementById('pairing-code-val');
+          display.style.display = 'block';
+          codeVal.innerText = d.pairingCode;
+          showToast('✅ Código gerado com sucesso! Digite no seu WhatsApp.');
+        } else {
+          showToast('❌ ' + (d.error || 'Erro ao gerar código'));
+        }
+      } catch (err) {
+        showToast('❌ Erro de conexão com o servidor');
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '📲 Obter Código';
+      }
+    });
+
     document.getElementById('btn-reset-session').addEventListener('click', async () => {
-      if (!confirm('Deseja desconectar a sessão atual do WhatsApp e gerar um NOVO QR Code?')) return;
+      if (!confirm('Deseja desconectar a sessão atual do WhatsApp e reiniciar a conexão?')) return;
       try {
         const res = await fetch('/api/trigger', {
           method: 'POST',
@@ -1468,7 +1645,9 @@ const server = http.createServer(async (req, res) => {
         });
         const d = await res.json();
         if (d.success) {
-          showToast('📲 Sessão resetada! Gerando novo QR Code...');
+          showToast('📲 Sessão reiniciada! Pronto para conectar.');
+          const display = document.getElementById('pairing-code-display');
+          if (display) display.style.display = 'none';
           updateStatus();
         }
       } catch (e) {}
@@ -1715,7 +1894,8 @@ async function startBot() {
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
-    browser: ['Whabot Group Joiner', 'Chrome', '1.0.0']
+    browser: Browsers.ubuntu('Chrome'),
+    getUrlInfo: getUrlInfo
   });
 
   globalSock = sock;
@@ -1728,7 +1908,7 @@ async function startBot() {
     if (qr) {
       latestQR = qr;
       isConnected = false;
-      console.log('\n📲 ESCANEIE O QR CODE ABAIXO NO SEU WHATSAPP OU ACESSE O LINK NA WEB:\n');
+      console.log('\n📲 QR CODE DISPONÍVEL (Ou conecte com número de telefone na dashboard/terminal):\n');
       qrcodeTerminal.generate(qr, { small: true });
       console.log('\nAbra o WhatsApp > Aparelhos Conectados > Conectar um Aparelho.\n');
     }
@@ -1736,6 +1916,7 @@ async function startBot() {
     if (connection === 'close') {
       isConnected = false;
       latestQR = null;
+      latestPairingCode = null;
       const statusCode = (lastDisconnect?.error)?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
