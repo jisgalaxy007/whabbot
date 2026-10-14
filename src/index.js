@@ -1980,57 +1980,65 @@ async function startBot() {
         const trimmedText = textContent.trim();
         const lowerText = trimmedText.toLowerCase();
 
-        // =========================================================
-        // 🔥 AUTO-CAPTURA: Detecta links de grupo em TODA mensagem
-        // (grupos, PV, qualquer conversa) — entra imediatamente!
-        // =========================================================
-        const autoLinks = extractInviteCodes(trimmedText);
-        if (autoLinks.length > 0) {
-          console.log(`\n🔗 [AUTO-CAPTURA] ${autoLinks.length} link(s) detectado(s) em mensagem de ${senderJid}`);
+        const isAnyCommand =
+          trimmedText.startsWith('!') ||
+          trimmedText.startsWith('.') ||
+          trimmedText.startsWith('/');
 
-          for (const item of autoLinks) {
-            // Evita entrar no mesmo grupo duas vezes (verifica DB + fila)
-            let jaExiste = false;
-            try {
-              const { addedCount } = await addLinks([item]);
-              if (addedCount === 0) {
-                jaExiste = true; // Já estava no banco (UNIQUE constraint)
+        // =========================================================
+        // 🔥 AUTO-CAPTURA: Detecta links de grupo em conversas normais (SEM comando)
+        // (grupos, PV, qualquer conversa comum) — entra imediatamente!
+        // =========================================================
+        if (!isAnyCommand) {
+          const autoLinks = extractInviteCodes(trimmedText);
+          if (autoLinks.length > 0) {
+            console.log(`\n🔗 [AUTO-CAPTURA] ${autoLinks.length} link(s) detectado(s) em mensagem de ${senderJid}`);
+
+            for (const item of autoLinks) {
+              // Evita entrar no mesmo grupo duas vezes (verifica DB + fila)
+              let jaExiste = false;
+              try {
+                const { addedCount } = await addLinks([item]);
+                if (addedCount === 0) {
+                  jaExiste = true; // Já estava no banco (UNIQUE constraint)
+                }
+              } catch (e) {
+                const localRes = queueManager.addToQueue([item], fromJid);
+                if (localRes.addedCount === 0) jaExiste = true;
               }
-            } catch (e) {
-              const localRes = queueManager.addToQueue([item], fromJid);
-              if (localRes.addedCount === 0) jaExiste = true;
-            }
 
-            if (jaExiste) {
-              console.log(`   ⏭️ Grupo já registrado, ignorando: ${item.url}`);
-              continue;
-            }
+              if (jaExiste) {
+                console.log(`   ⏭️ Grupo já registrado, ignorando: ${item.url}`);
+                continue;
+              }
 
-            console.log(`   ⚡ Entrando automaticamente: ${item.url}`);
-            const result = await joinGroup(sock, item.code);
+              console.log(`   ⚡ Entrando automaticamente: ${item.url}`);
+              const result = await joinGroup(sock, item.code);
 
-            if (result.success) {
-              console.log(`   ✅ Entrou: "${result.groupName}"`);
-              try { await updateLinkStatus(item.code, 'success', result.groupName, 'Auto-captura'); } catch(e) {}
-              queueManager.markProcessed(item.code, 'success', 'Auto-captura', result.groupName);
+              if (result.success) {
+                console.log(`   ✅ Entrou: "${result.groupName}"`);
+                try { await updateLinkStatus(item.code, 'success', result.groupName, 'Auto-captura'); } catch(e) {}
+                queueManager.markProcessed(item.code, 'success', 'Auto-captura', result.groupName);
+                if (!fromJid.endsWith('@g.us')) {
+                  await sock.sendMessage(fromJid, {
+                    text: `✅ *Entrei no Grupo!*\n\n• Grupo: *${result.groupName}*\n• Link: ${item.url}`
+                  });
+                }
+              } else if (result.isRateLimited) {
+                console.log(`   ⏳ Rate limit ao entrar: ${item.url}. Colocado na fila.`);
+                try { await updateLinkStatus(item.code, 'rate_limited', '', result.reason); } catch(e) {}
+              } else {
+                console.log(`   ❌ Falha ao entrar: ${result.reason}`);
+                try { await updateLinkStatus(item.code, 'failed', '', result.reason); } catch(e) {}
+                queueManager.markProcessed(item.code, 'failed', result.reason, '');
+              }
 
-            } else if (result.isRateLimited) {
-              console.log(`   ⏳ Rate limit ao entrar: ${item.url}. Colocado na fila.`);
-              try { await updateLinkStatus(item.code, 'rate_limited', '', result.reason); } catch(e) {}
-
-            } else {
-              console.log(`   ❌ Falha ao entrar: ${result.reason}`);
-              try { await updateLinkStatus(item.code, 'failed', '', result.reason); } catch(e) {}
-              queueManager.markProcessed(item.code, 'failed', result.reason, '');
-            }
-
-            // Pequeno delay entre links se vieram vários juntos
-            if (autoLinks.length > 1) {
-              await sleep(getRandomDelay(config.minDelaySeconds, config.maxDelaySeconds));
+              // Pequeno delay entre links se vieram vários juntos
+              if (autoLinks.length > 1) {
+                await sleep(getRandomDelay(config.minDelaySeconds, config.maxDelaySeconds));
+              }
             }
           }
-
-          // Após auto-captura, continua para verificar se também é um comando
         }
 
         // =========================================================
@@ -2038,7 +2046,7 @@ async function startBot() {
         // Responde mensagens, marca mensagem enviada, usa menção invisível em grupos
         // Cooldown de 1 hora por JID para evitar spam e ban do WhatsApp
         // =========================================================
-        if (autoRespMode !== 'off' && !trimmedText.startsWith('!')) {
+        if (autoRespMode !== 'off' && !isAnyCommand) {
           const isGroup = fromJid.endsWith('@g.us');
           let responder = (autoRespMode === 'all') ||
                           (autoRespMode === 'gp' && isGroup) ||
@@ -2054,8 +2062,15 @@ async function startBot() {
           }
         }
 
-        // Filtro de administradores para comandos
-        if (config.adminJids.length > 0 && !config.adminJids.includes(senderJid.split('@')[0])) {
+        // Filtro de administradores para comandos (respeita allowAllAdmins)
+        const isUserAdmin =
+          config.allowAllAdmins ||
+          !config.adminJids ||
+          config.adminJids.length === 0 ||
+          config.adminJids.includes(senderJid.split('@')[0]) ||
+          config.adminJids.includes(senderJid);
+
+        if (!isUserAdmin) {
           continue;
         }
 
@@ -2445,8 +2460,14 @@ _Modo RDB Atual:_ *${rdbModeEnabled ? '⚡ ATIVADO' : '⏹️ DESATIVADO'}*`;
         // ---------------------------------------------------------
         // 5. COMANDO: !entrar <links> (Modo padrão: cadastra e processa)
         // ---------------------------------------------------------
-        if (trimmedText.startsWith(config.prefix)) {
-          console.log(`\n📩 Comando ${config.prefix} recebido de: ${senderJid}`);
+        const isEntrarTrigger =
+          lowerText === '!entrar' || lowerText.startsWith('!entrar ') ||
+          lowerText === '.entrar' || lowerText.startsWith('.entrar ') ||
+          lowerText === '/entrar' || lowerText.startsWith('/entrar ') ||
+          trimmedText.startsWith(config.prefix);
+
+        if (isEntrarTrigger) {
+          console.log(`\n📩 Comando Entrar recebido de: ${senderJid}`);
           let linksToProcess = [];
 
           const linksFromText = extractInviteCodes(trimmedText);
@@ -2480,9 +2501,9 @@ _Modo RDB Atual:_ *${rdbModeEnabled ? '⚡ ATIVADO' : '⏹️ DESATIVADO'}*`;
           }
 
           // Arquivo local .txt
-          const args = trimmedText.slice(config.prefix.length).trim().split(/\s+/);
-          if (args.length > 0 && args[0].endsWith('.txt')) {
-            const localFilePath = path.resolve(process.cwd(), args[0]);
+          const commandWords = trimmedText.split(/\s+/);
+          if (commandWords.length > 1 && commandWords[1].endsWith('.txt')) {
+            const localFilePath = path.resolve(process.cwd(), commandWords[1]);
             if (fs.existsSync(localFilePath)) {
               try {
                 const content = fs.readFileSync(localFilePath, 'utf-8');
@@ -2502,15 +2523,49 @@ _Modo RDB Atual:_ *${rdbModeEnabled ? '⚡ ATIVADO' : '⏹️ DESATIVADO'}*`;
 
           if (uniqueLinks.length === 0) {
             await sock.sendMessage(fromJid, {
-              text: `⚠️ Nenhum link de grupo válido do WhatsApp foi encontrado.\n\nDigite \`!menu\` para ver a lista de comandos disponíveis.`
+              text: `📥 *COMO ENTRAR EM GRUPOS:*\n\n` +
+                    `• *Enviar links diretamente:*\n` +
+                    `  \`!entrar https://chat.whatsapp.com/XYZ\`\n` +
+                    `  _(Pode colar 1 ou dezenas de links na mesma mensagem)_\n\n` +
+                    `• *Enviar arquivo .txt:*\n` +
+                    `  Envie um arquivo \`.txt\` com os links e a legenda \`!entrar\`\n\n` +
+                    `• *Processar fila pendente do banco:*\n` +
+                    `  \`!entrar db\`\n\n` +
+                    `• *Alternar modo tempo real (RDB):*\n` +
+                    `  \`!entrar rdb\``
             });
             continue;
           }
 
-          // Salva na fila local sempre como contingência
-          const localRes = queueManager.addToQueue(uniqueLinks, fromJid);
+          // Se for 1 único link: processa IMEDIATAMENTE e responde na hora
+          if (uniqueLinks.length === 1) {
+            const single = uniqueLinks[0];
+            await sock.sendMessage(fromJid, { text: `⏳ *Entrando no grupo...*\nLink: ${single.url}` });
+            const result = await joinGroup(sock, single.code);
 
-          // Tenta salvar também no PostgreSQL
+            if (result.success) {
+              try { await updateLinkStatus(single.code, 'success', result.groupName, result.reason || 'Entrada manual'); } catch (e) {}
+              queueManager.markProcessed(single.code, 'success', result.reason, result.groupName);
+              await sock.sendMessage(fromJid, {
+                text: `✅ *Entrei no Grupo com Sucesso!*\n\n• *Nome:* ${result.groupName}\n• *Link:* ${single.url}`
+              });
+            } else if (result.isRateLimited) {
+              try { await updateLinkStatus(single.code, 'rate_limited', '', result.reason); } catch (e) {}
+              await sock.sendMessage(fromJid, {
+                text: `⏳ *Limite Temporário do WhatsApp*\n\nO WhatsApp atingiu o limite de entradas no momento. O link foi salvo na fila para a próxima tentativa automática.`
+              });
+            } else {
+              try { await updateLinkStatus(single.code, 'failed', '', result.reason); } catch (e) {}
+              queueManager.markProcessed(single.code, 'failed', result.reason, '');
+              await sock.sendMessage(fromJid, {
+                text: `❌ *Falha ao Entrar no Grupo*\n\n• *Motivo:* ${result.reason}\n• *Link:* ${single.url}`
+              });
+            }
+            continue;
+          }
+
+          // Se forem múltiplos links: salva no banco/fila e processa a fila com delay seguro
+          const localRes = queueManager.addToQueue(uniqueLinks, fromJid);
           let dbAdded = 0;
           let dbPending = 0;
           try {
@@ -2525,10 +2580,11 @@ _Modo RDB Atual:_ *${rdbModeEnabled ? '⚡ ATIVADO' : '⏹️ DESATIVADO'}*`;
           const totalPending = dbPending || localRes.totalPending;
 
           await sock.sendMessage(fromJid, {
-            text: `📥 *Links Registrados*\n\n• Novos links inseridos: *${addedCount}*\n• Total pendente: *${totalPending}*\n\nIniciando o processamento...`
+            text: `📥 *Links Registrados*\n\n• Novos links inseridos: *${addedCount}*\n• Total pendente: *${totalPending}*\n\nIniciando entradas com delay seguro anti-ban...`
           });
 
           await processHybridQueue(sock, fromJid);
+          continue;
         }
       }
     } catch (err) {

@@ -1,46 +1,89 @@
 import pg from 'pg';
+import fs from 'fs';
+import path from 'path';
 
 const { Pool } = pg;
 
-const connectionString =
-  process.env.DATABASE_URL ||
-  'postgresql://rdb_11ww_user:XZwi9aNOlPCiwyV3HuYizJ7RBsnDFALe@dpg-da1umt7lk1mc73ad5nlg-a.oregon-postgres.render.com/rdb_11ww';
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : process.cwd();
+const QUEUE_FILE = path.resolve(DATA_DIR, 'queue.json');
+
+// URL padrão: Cluster Fly Postgres interno (metaai-db / whabot_db)
+const defaultFlyPostgresUrl =
+  'postgres://whabot:b51g1VGhWsMX5QY@metaai-db.flycast:5432/whabot_db?sslmode=disable';
+
+const connectionString = process.env.DATABASE_URL || defaultFlyPostgresUrl;
+
+const isSslDisabled =
+  connectionString.includes('sslmode=disable') ||
+  connectionString.includes('.flycast') ||
+  connectionString.includes('localhost') ||
+  connectionString.includes('127.0.0.1');
 
 export const pool = new Pool({
   connectionString,
-  ssl: {
-    rejectUnauthorized: false
-  },
-  max: 10, // Máximo de conexões no pool
-  idleTimeoutMillis: 30000, // Fecha conexões ociosas após 30 segundos
-  connectionTimeoutMillis: 10000 // Timeout de 10 segundos ao tentar conectar
+  ssl: isSslDisabled ? false : { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 20000,
+  connectionTimeoutMillis: 3500 // 3.5 segundos para falhar rápido e nunca travar o bot
 });
 
-// Trata erros de conexões ociosas caindo no banco do Render para não derrubar a aplicação
+// Flag de circuito: se o DB falhar consecutivamente, pausa chamadas por 20 segundos
+let isDbHealthy = true;
+let nextDbCheckTime = 0;
+
 pool.on('error', (err) => {
-  console.error('⚠️ [PostgreSQL Pool Warning] Conexão ociosa descartada pelo banco:', err.message);
+  console.warn('⚠️ [PostgreSQL Pool Warning]:', err.message);
+  isDbHealthy = false;
+  nextDbCheckTime = Date.now() + 20000;
 });
+
+// Funções auxiliares para fila local quando o banco estiver offline
+function loadLocalQueue() {
+  try {
+    if (fs.existsSync(QUEUE_FILE)) {
+      return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf-8'));
+    }
+  } catch (e) {}
+  return { pending: [], history: [], nextScheduledRun: null };
+}
+
+function saveLocalQueue(data) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {}
+}
 
 /**
- * Função utilitária para executar consultas com auto-retry caso a conexão caia
+ * Função utilitária para executar consultas com auto-retry rápido
  */
-async function executeWithRetry(fn, retries = 3) {
+async function executeWithRetry(fn, retries = 2) {
+  if (!isDbHealthy && Date.now() < nextDbCheckTime) {
+    throw new Error('PostgreSQL temporariamente em modo de espera por falha anterior');
+  }
+
   let attempt = 0;
   while (attempt < retries) {
     attempt++;
     try {
-      return await fn();
+      const res = await fn();
+      isDbHealthy = true;
+      return res;
     } catch (err) {
       const isConnError =
         err.message.includes('terminated unexpectedly') ||
         err.message.includes('closed') ||
         err.message.includes('timeout') ||
+        err.message.includes('connect ECONNREFUSED') ||
         err.code === '57P01';
 
       if (isConnError && attempt < retries) {
-        console.warn(`⚠️ Conexão PostgreSQL oscilou (tentativa ${attempt}/${retries}). Reconectando em 1s...`);
-        await new Promise((r) => setTimeout(r, 1000));
+        await new Promise((r) => setTimeout(r, 600));
       } else {
+        if (isConnError) {
+          isDbHealthy = false;
+          nextDbCheckTime = Date.now() + 20000;
+        }
         throw err;
       }
     }
@@ -74,14 +117,12 @@ export async function initDb() {
     });
     console.log('🐘 PostgreSQL conectado e tabela group_links pronta!');
   } catch (err) {
-    console.error('❌ Erro ao conectar/inicializar banco PostgreSQL:', err.message);
+    console.warn('⚠️ PostgreSQL offline ou inacessível no momento. Usando armazenamento local em disco (/var/data):', err.message);
   }
 }
 
 /**
- * Adiciona novos convites ao PostgreSQL (ignorando códigos já existentes)
- * @param {Array<{code: string, url: string}>} items 
- * @returns {Promise<{addedCount: number, totalPending: number}>}
+ * Adiciona novos convites ao PostgreSQL ou fila local
  */
 export async function addLinks(items) {
   if (!items || items.length === 0) {
@@ -115,17 +156,34 @@ export async function addLinks(items) {
         client.release();
       }
     });
+    const totalPending = await getPendingCount();
+    return { addedCount, totalPending };
   } catch (err) {
-    console.error('Erro ao adicionar links no PostgreSQL:', err.message);
-  }
+    // Fallback transparente para armazenamento local em arquivo
+    const local = loadLocalQueue();
+    const existingCodes = new Set([
+      ...local.pending.map((i) => i.code),
+      ...local.history.map((h) => h.code)
+    ]);
 
-  const totalPending = await getPendingCount();
-  return { addedCount, totalPending };
+    for (const item of items) {
+      if (!existingCodes.has(item.code)) {
+        existingCodes.add(item.code);
+        local.pending.push({
+          code: item.code,
+          url: item.url,
+          addedAt: new Date().toISOString()
+        });
+        addedCount++;
+      }
+    }
+    saveLocalQueue(local);
+    return { addedCount, totalPending: local.pending.length };
+  }
 }
 
 /**
- * Retorna todos os links com status 'pending' no banco de dados
- * @returns {Promise<Array<{id: number, code: string, url: string}>>}
+ * Retorna todos os links com status 'pending'
  */
 export async function getPendingLinks() {
   try {
@@ -136,14 +194,17 @@ export async function getPendingLinks() {
       return res.rows;
     });
   } catch (err) {
-    console.error('Erro ao buscar links pendentes no PostgreSQL:', err.message);
-    return [];
+    const local = loadLocalQueue();
+    return local.pending.map((item, idx) => ({
+      id: idx + 1,
+      code: item.code,
+      url: item.url
+    }));
   }
 }
 
 /**
  * Retorna o total de links com status 'pending'
- * @returns {Promise<number>}
  */
 export async function getPendingCount() {
   try {
@@ -152,16 +213,13 @@ export async function getPendingCount() {
       return res.rows[0]?.count || 0;
     });
   } catch (err) {
-    return 0;
+    const local = loadLocalQueue();
+    return local.pending.length;
   }
 }
 
 /**
  * Atualiza o status e informações de um link após a tentativa de entrada
- * @param {string} code 
- * @param {string} status - 'success' | 'failed' | 'rate_limited'
- * @param {string} groupName 
- * @param {string} reason 
  */
 export async function updateLinkStatus(code, status, groupName = '', reason = '') {
   try {
@@ -174,12 +232,25 @@ export async function updateLinkStatus(code, status, groupName = '', reason = ''
       );
     });
   } catch (err) {
-    console.error(`Erro ao atualizar status do código ${code}:`, err.message);
+    // Atualiza na fila local
+    const local = loadLocalQueue();
+    const idx = local.pending.findIndex((p) => p.code === code);
+    if (idx !== -1) {
+      const item = local.pending.splice(idx, 1)[0];
+      local.history.push({
+        ...item,
+        status,
+        groupName,
+        reason,
+        processedAt: new Date().toISOString()
+      });
+      saveLocalQueue(local);
+    }
   }
 }
 
 /**
- * Retorna o resumo estatístico de todos os links no banco
+ * Retorna o resumo estatístico de todos os links no banco ou fila local
  */
 export async function getStats() {
   try {
@@ -193,32 +264,39 @@ export async function getStats() {
           COUNT(*) FILTER (WHERE status = 'rate_limited')::int as rate_limited
         FROM group_links;
       `);
-      return res.rows[0];
+      return res.rows[0] || { total: 0, pending: 0, success: 0, failed: 0, rate_limited: 0 };
     });
   } catch (err) {
-    return { total: 0, pending: 0, success: 0, failed: 0, rate_limited: 0 };
+    const local = loadLocalQueue();
+    const pending = local.pending.length;
+    const success = local.history.filter((h) => h.status === 'success').length;
+    const failed = local.history.filter((h) => h.status === 'failed').length;
+    const rateLimited = local.history.filter((h) => h.status === 'rate_limited').length;
+    const total = pending + local.history.length;
+    return { total, pending, success, failed, rate_limited: rateLimited };
   }
 }
 
 /**
- * Remove todos os links do banco de dados
- * @returns {Promise<number>} Quantidade de registros deletados
+ * Remove todos os links do banco de dados e da fila local
  */
 export async function deleteAllLinks() {
+  let count = 0;
   try {
-    return await executeWithRetry(async () => {
+    await executeWithRetry(async () => {
       const res = await pool.query(`DELETE FROM group_links;`);
-      console.log(`🗑️ ${res.rowCount} links excluídos do PostgreSQL.`);
-      return res.rowCount;
+      count = res.rowCount;
     });
-  } catch (err) {
-    console.error('Erro ao deletar links do PostgreSQL:', err.message);
-    return 0;
-  }
+  } catch (err) {}
+
+  const local = loadLocalQueue();
+  count = Math.max(count, local.pending.length + local.history.length);
+  saveLocalQueue({ pending: [], history: [], nextScheduledRun: null });
+  return count;
 }
 
 /**
- * Retorna todos os links cadastrados (para GET /api/links)
+ * Retorna todos os links cadastrados (para GET /api/links e dashboard)
  */
 export async function getAllLinks(statusFilter = null) {
   try {
@@ -238,7 +316,28 @@ export async function getAllLinks(statusFilter = null) {
       return res.rows;
     });
   } catch (err) {
-    console.error('Erro ao listar links:', err.message);
-    return [];
+    const local = loadLocalQueue();
+    const all = [
+      ...local.pending.map((p) => ({
+        code: p.code,
+        url: p.url,
+        status: 'pending',
+        group_name: '',
+        reason: '',
+        created_at: p.addedAt
+      })),
+      ...local.history.map((h) => ({
+        code: h.code,
+        url: h.url,
+        status: h.status || 'processed',
+        group_name: h.groupName || '',
+        reason: h.reason || '',
+        created_at: h.addedAt || h.processedAt
+      }))
+    ];
+    if (statusFilter) {
+      return all.filter((i) => i.status === statusFilter);
+    }
+    return all.slice(0, 500);
   }
 }

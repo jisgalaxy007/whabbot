@@ -12,14 +12,16 @@ import fs from 'fs';
 export function extractInviteCodes(text) {
   if (!text || typeof text !== 'string') return [];
   
-  // Regex para capturar links de grupos do WhatsApp
-  const regex = /(?:https?:\/\/)?chat\.whatsapp\.com\/(?:invite\/)?([a-zA-Z0-9]{20,26})/gi;
+  // Regex aprimorada para capturar links de grupos do WhatsApp (suporta invite/, www, queries e códigos de 18 a 34 chars)
+  const regex = /(?:https?:\/\/)?(?:www\.)?chat\.whatsapp\.com\/(?:invite\/)?([a-zA-Z0-9_-]{18,34})/gi;
   const matches = [];
   const seenCodes = new Set();
 
   let match;
   while ((match = regex.exec(text)) !== null) {
     const code = match[1];
+    // Evita falsos positivos com palavras reservadas
+    if (code.toLowerCase() === 'invite' || code.toLowerCase() === 'channel') continue;
     if (!seenCodes.has(code)) {
       seenCodes.add(code);
       matches.push({

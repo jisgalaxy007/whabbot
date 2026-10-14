@@ -1,6 +1,6 @@
 # fly.toml app configuration file for Whabot
-app = 'whabot-mz'
-primary_region = 'jnb'
+app = 'whabot'
+primary_region = 'ams'
 
 [build]
   dockerfile = 'Dockerfile'
@@ -8,6 +8,7 @@ primary_region = 'jnb'
 [env]
   PORT = '3000'
   DATA_DIR = '/var/data'
+  DATABASE_URL = 'postgres://whabot:b51g1VGhWsMX5QY@metaai-db.flycast:5432/whabot_db?sslmode=disable'
 
 [http_service]
   internal_port = 3000
@@ -18,9 +19,9 @@ primary_region = 'jnb'
   processes = ['app']
 
 [[vm]]
-  memory = '512mb'
+  memory = '1024mb'
   cpu_kind = 'shared'
-  cpus = 1
+  cpus = 2
 
 [[mounts]]
   source = 'whabot_data'
